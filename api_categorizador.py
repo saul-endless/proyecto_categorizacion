@@ -43,7 +43,7 @@ executor = ThreadPoolExecutor(max_workers=1) # 1 Worker para asegurar que no cho
 # Importacion del extractor IA
 sys.path.append(str(DIR_EXTRACTOR))
 try:
-    import extractor_ia # type: ignore
+    import extractor_gemini_ai as extractor_ia
 except ImportError:
     print("Error CRITICO: No se encontro el modulo extractor_ia.py")
 
