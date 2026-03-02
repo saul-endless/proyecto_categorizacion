@@ -1,214 +1,183 @@
-# Se importan las librerias necesarias para manejo de sistema y archivos
+# Se importan las librerias necesarias para manejo de sistema, archivos y modelo
 import os
 import sys
-import shutil
-import time
-import importlib.util
+import json
 from pathlib import Path
 
-# Se definen las rutas base de los proyectos
+# Intentamos importar la libreria del modelo
+try:
+    from llama_cpp import Llama 
+except ImportError:
+    print("Error critico: La libreria llama_cpp no esta instalada.")
+    print("Ejecuta: pip install llama-cpp-python")
+    sys.exit(1)
+
+# Se definen las rutas base del sistema (siguiendo la estructura del orquestador)
 BASE_DIR = Path("/home/endless/FUNCIONALIDADES")
-DIR_CATEGORIZACION = BASE_DIR / "PROYECTO CATEGORIZACION"
 DIR_EXTRACTOR = BASE_DIR / "PROYECTO EXTRACTOR"
 DIR_MODELOS = BASE_DIR / "PRUEBA MODELOS"
 
-# Se definen las carpetas de input y output del orquestador
-ORQ_INPUT = DIR_CATEGORIZACION / "input"
-ORQ_OUTPUT = DIR_CATEGORIZACION / "output"
+# Rutas especificas de entrada de datos y ubicacion del modelo
+RUTA_DATOS_JSON = DIR_EXTRACTOR / "output"
+RUTA_MODELO_LLM = DIR_MODELOS / "MODELOS/Llama-3.3-70B-Instruct-GGUF"
 
-# Se definen las carpetas internas de los proyectos existentes
-EXT_INPUT = DIR_EXTRACTOR / "input"
-EXT_OUTPUT = DIR_EXTRACTOR / "output"
-MOD_INPUT = DIR_MODELOS / "INPUT"
-MOD_OUTPUT = DIR_MODELOS / "OUTPUT"
+# Configuracion del sistema
+N_CTX = 8192  # Ventana de contexto amplia para leer varios archivos
+N_GPU_LAYERS = -1  # Usa toda la GPU disponible
 
-# Importacion del extractor IA
-sys.path.append(str(DIR_EXTRACTOR))
-try:
-    import extractor_ia # type: ignore
-except ImportError:
-    print("Error: No se encontro el modulo extractor_ia.py en la ruta del extractor.")
+def cargar_contexto_financiero(directorio_datos):
+    # Se busca y consolida la informacion de todos los archivos json en la ruta
+    if not directorio_datos.exists():
+        print(f"Advertencia: La ruta {directorio_datos} no existe.")
+        return ""
 
-def limpiar_directorio(directorio):
-    # Se eliminan archivos previos en un directorio para evitar mezclas
-    if directorio.exists():
-        for archivo in directorio.glob("*"):
-            if archivo.is_file():
-                archivo.unlink()
+    archivos_json = list(directorio_datos.glob("*.json"))
+    
+    if not archivos_json:
+        print("Aviso: No se encontraron archivos JSON en la carpeta de output.")
+        return ""
 
-def obtener_ultimo_archivo(directorio, patron="*"):
-    # Se obtiene el archivo mas reciente en un directorio dado
-    archivos = list(directorio.glob(patron))
-    if not archivos:
+    print(f"Procesando {len(archivos_json)} archivos de datos financieros...")
+    
+    texto_consolidado = ""
+    
+    for archivo in archivos_json:
+        try:
+            with open(archivo, 'r', encoding='utf-8') as f:
+                datos = json.load(f)
+                nombre_archivo = archivo.name
+                
+                # Se etiqueta el inicio de cada archivo para que el modelo sepa la fuente
+                texto_consolidado += f"\n--- INFORMACION DEL ARCHIVO: {nombre_archivo} ---\n"
+                texto_consolidado += json.dumps(datos, indent=2, ensure_ascii=False)
+                texto_consolidado += "\n"
+        except Exception as e:
+            print(f"Error al leer el archivo {archivo.name}: {e}")
+
+    return texto_consolidado
+
+def cargar_modelo_local(ruta_modelo):
+    # Se inicializa el modelo LLM desde la ruta local especificada
+    if not ruta_modelo.exists():
+        # A veces la ruta puede ser un archivo directo sin extension visible o con ella
+        # Verificamos si existe como archivo string
+        if not os.path.exists(str(ruta_modelo)):
+            print(f"Error critico: No se encuentra el archivo del modelo en: {ruta_modelo}")
+            return None
+
+    print(f"Cargando modelo desde: {ruta_modelo}")
+    print("Espere un momento, cargando en memoria...")
+
+    try:
+        llm = Llama(
+            model_path=str(ruta_modelo),
+            n_ctx=N_CTX,
+            n_gpu_layers=N_GPU_LAYERS,
+            verbose=False # Se desactiva el log tecnico para mantener la consola limpia
+        )
+        return llm
+    except Exception as e:
+        print(f"Error fatal al cargar el modelo: {e}")
         return None
-    return max(archivos, key=os.path.getctime)
 
-def cargar_modulo_con_espacios(ruta_archivo, nombre_modulo):
-    # Se carga dinamicamente un modulo python cuyo nombre o ruta tiene espacios
-    spec = importlib.util.spec_from_file_location(nombre_modulo, ruta_archivo)
-    modulo = importlib.util.module_from_spec(spec)
-    sys.modules[nombre_modulo] = modulo
-    spec.loader.exec_module(modulo)
-    return modulo
+def construir_prompt_sistema():
+    # Se define la personalidad estricta del asesor financiero
+    prompt = """
+    Eres un asesor financiero personal experto.
+    
+    TUS REGLAS DE RESPUESTA:
+    1. LENGUAJE SENCILLO: Explica conceptos complejos usando analogias de la vida diaria (ejemplo: compara una deuda con una mochila pesada, o el flujo de efectivo con el agua en un tanque).
+    2. DATOS CONCRETOS: Debes usar OBLIGATORIAMENTE los numeros que aparecen en el contexto. No digas "gastaste mucho", di "gastaste 5,000 pesos".
+    3. CERO TECNICISMOS: No uses palabras como "EBITDA", "Rendimiento Anualizado" o "Pasivo Circulante" sin explicarlas con palabras de niño de 10 años.
+    4. FONDO DE VERDAD: Tu respuesta se basa exclusivamente en los archivos JSON proporcionados. Si no hay datos, dilo claramente.
+    """
+    return prompt
+
+def consultar_modelo(llm, contexto, pregunta_usuario):
+    # Se envia la consulta al modelo integrando el contexto de los archivos
+    
+    sistema = construir_prompt_sistema()
+    
+    # Se inyecta el contexto de los archivos dentro del mensaje del usuario
+    # para asegurar que el modelo lo tenga presente en esta interaccion
+    prompt_usuario_completo = f"""
+    CONTEXTO DE LOS DATOS FINANCIEROS (ARCHIVOS JSON):
+    {contexto}
+
+    PREGUNTA DEL CLIENTE:
+    {pregunta_usuario}
+    """
+
+    mensajes = [
+        {"role": "system", "content": sistema},
+        {"role": "user", "content": prompt_usuario_completo}
+    ]
+
+    respuesta = llm.create_chat_completion(
+        messages=mensajes,
+        temperature=0.7, # Creatividad balanceada para analogias
+        max_tokens=1000
+    )
+
+    return respuesta['choices'][0]['message']['content']
 
 def main():
-    # Se verifica que existan las carpetas de trabajo
-    if not ORQ_INPUT.exists() or not ORQ_OUTPUT.exists():
-        print("Error: Asegurate de crear las carpetas input y output en PROYECTO CATEGORIZACION")
+    # Se verifica que existan las carpetas necesarias
+    if not DIR_EXTRACTOR.exists():
+        print("Error: No se encuentra el directorio del proyecto extractor.")
         return
 
-    # Se busca el PDF en la carpeta de input del orquestador
-    pdfs = list(ORQ_INPUT.glob("*.pdf"))
-    if not pdfs:
-        print("No se encontraron PDFs en la carpeta input de PROYECTO CATEGORIZACION.")
-        return
+    print("--- INICIANDO SISTEMA DE CHATBOT FINANCIERO ---")
+
+    # 1. Carga de datos
+    print("\n>>> FASE 1: CARGA DE CONTEXTO")
+    contexto_datos = cargar_contexto_financiero(RUTA_DATOS_JSON)
     
-    pdf_actual = pdfs[0]
-    print(f"Procesando archivo: {pdf_actual.name}")
-
-    # =========================================================
-    # FASE 1: EXTRACCION DE DATOS (IA VISUAL - QWEN)
-    # =========================================================
-    print("\n>>> FASE 1: EXTRACCION VISUAL (GPU - QWEN)...")
-
-    # Se limpian las carpetas del extractor para asegurar proceso limpio
-    EXT_INPUT.mkdir(parents=True, exist_ok=True)
-    EXT_OUTPUT.mkdir(parents=True, exist_ok=True)
-    limpiar_directorio(EXT_INPUT)
-    limpiar_directorio(EXT_OUTPUT)
-
-    # Se copia el PDF al input del extractor
-    ruta_pdf_destino = EXT_INPUT / pdf_actual.name
-    shutil.copy(pdf_actual, ruta_pdf_destino)
-
-    # Se ejecuta el extractor IA
-    try:
-        os.chdir(DIR_EXTRACTOR)
-        # Llamada directa a la funcion main del extractor IA
-        extractor_ia.main_extraction_ia(str(ruta_pdf_destino), str(EXT_OUTPUT))
-    except Exception as e:
-        print(f"Error durante la ejecucion del extractor IA: {e}")
-        return
-
-    # Se mueven los resultados JSON al output del orquestador
-    archivos_generados = list(EXT_OUTPUT.glob("*.json"))
-    rutas_jsons_procesar = []
-    ruta_datos_json = None
-
-    for json_file in archivos_generados:
-        destino = ORQ_OUTPUT / json_file.name
-        shutil.move(str(json_file), str(destino))
-        print(f"Archivo generado movido: {json_file.name}")
-        
-        # Identificamos los archivos para las siguientes fases
-        if "_INGRESOS.json" in json_file.name or "_EGRESOS.json" in json_file.name:
-            rutas_jsons_procesar.append(destino)
-        if "_DATOS.json" in json_file.name:
-            ruta_datos_json = destino
-
-    # ---------------------------------------------------------
-    # GESTION GPU: Qwen libera memoria al terminar, Llama carga limpio
-    # ---------------------------------------------------------
-    
-    # Preparacion entorno modelos
-    MOD_INPUT.mkdir(parents=True, exist_ok=True)
-    MOD_OUTPUT.mkdir(parents=True, exist_ok=True)
-    
-    ruta_script_modelos = DIR_MODELOS / "PROBAR DIVERSOS MODELOS 2.py"
-    modulo_modelos = cargar_modulo_con_espacios(ruta_script_modelos, "modulo_modelos")
-
-    # Configuración del modelo (Usamos 8B por defecto)
-    ruta_modelo_a_usar = modulo_modelos.RUTA_MODELO_8B 
-    print(f"Cargando modelo LLM desde: {ruta_modelo_a_usar}")
-    os.chdir(DIR_MODELOS)
-    
-    llm = modulo_modelos.cargar_modelo(ruta_modelo_a_usar)
-    if not llm:
-        print("Error: No se pudo cargar el modelo LLM.")
-        return
-
-    # =========================================================
-    # FASE 2: CATEGORIZACION DE TRANSACCIONES (GPU)
-    # =========================================================
-    print("\n>>> FASE 2: CATEGORIZACION (GPU)...")
-
-    # Archivos que necesitaremos tener listos para la fase 3
-    archivos_con_giros_generados = []
-
-    for ruta_json in rutas_jsons_procesar:
-        print(f"Categorizando archivo: {ruta_json.name}")
-
-        # Se copia el archivo al INPUT del modelo
-        destino_input_modelo = MOD_INPUT / ruta_json.name
-        shutil.copy(ruta_json, destino_input_modelo)
-
-        tiempo_inicio = time.time()
-
-        # Ejecuta la logica del modelo pasando el nombre del archivo
-        modulo_modelos.procesar_logica_fusion(llm, ruta_json.name)
-
-        # Buscamos el output "ANALISIS_..."
-        nombre_base_sin_ext = ruta_json.stem
-        patron_analisis = f"ANALISIS_{nombre_base_sin_ext}_*.json"
-        archivo_resultado = obtener_ultimo_archivo(MOD_OUTPUT, patron_analisis)
-        
-        if archivo_resultado and archivo_resultado.stat().st_mtime >= tiempo_inicio:
-            nuevo_nombre = f"{nombre_base_sin_ext}_CON_GIROS.json".upper()
-            ruta_destino_final = ORQ_OUTPUT / nuevo_nombre
-            
-            shutil.move(str(archivo_resultado), str(ruta_destino_final))
-            archivos_con_giros_generados.append(ruta_destino_final)
-            print(f"Categorizacion finalizada. Guardado en: {ruta_destino_final.name}")
-        else:
-            print(f"Error: No se genero el archivo de analisis para {ruta_json.name}")
-
-    # =========================================================
-    # FASE 3: PERFILADO EMPRESARIAL (GPU)
-    # =========================================================
-    if ruta_datos_json and len(archivos_con_giros_generados) >= 2:
-        print("\n>>> FASE 3: PERFILADO EMPRESARIAL (GPU)...")
-        
-        # 1. Copiar _DATOS.json al input de modelos
-        shutil.copy(ruta_datos_json, MOD_INPUT / ruta_datos_json.name)
-        
-        # 2. Copiar los archivos _CON_GIROS generados al input de modelos
-        # (El script de perfilado los busca ahí para cruzarlos)
-        for archivo_giro in archivos_con_giros_generados:
-            shutil.copy(archivo_giro, MOD_INPUT / archivo_giro.name)
-
-        print(f"Perfilando empresa basada en: {ruta_datos_json.name}")
-        
-        tiempo_inicio_perfil = time.time()
-        
-        # Ejecutamos el perfilado
-        modulo_modelos.procesar_perfilado_empresarial(llm, ruta_datos_json.name)
-        
-        # El resultado se guarda en MOD_OUTPUT con el mismo nombre que la entrada (_DATOS.json)
-        resultado_perfil = MOD_OUTPUT / ruta_datos_json.name
-        
-        if resultado_perfil.exists() and resultado_perfil.stat().st_mtime >= tiempo_inicio_perfil:
-            nombre_final_perfil = ruta_datos_json.stem + "_CON_GIRO.json"
-            nombre_final_perfil = nombre_final_perfil.upper() # Todo mayusculas
-            
-            ruta_destino_perfil = ORQ_OUTPUT / nombre_final_perfil
-            shutil.move(str(resultado_perfil), str(ruta_destino_perfil))
-            
-            print(f"Perfilado finalizado. Guardado en: {ruta_destino_perfil.name}")
-        else:
-             print("Error: No se generó el archivo de perfilado correctamente.")
-
+    if not contexto_datos:
+        print("Advertencia: Se iniciara el chat sin datos financieros cargados.")
     else:
-        print("\n[SKIP] Fase 3 omitida: Faltan archivos _DATOS o los archivos de giros.")
+        print("Datos financieros cargados correctamente en memoria.")
 
-    # Limpieza final de memoria
+    # 2. Carga del modelo
+    print("\n>>> FASE 2: INICIALIZACION DEL MODELO (GPU)")
+    llm = cargar_modelo_local(RUTA_MODELO_LLM)
+    
+    if not llm:
+        print("No se pudo iniciar el sistema. Terminando programa.")
+        return
+
+    print("\n" + "="*50)
+    print("ASESOR FINANCIERO LISTO")
+    print("Escribe 'salir' para terminar la sesion.")
+    print("="*50 + "\n")
+
+    # 3. Bucle de interaccion
+    while True:
+        try:
+            pregunta = input("Usuario: ")
+            
+            if pregunta.lower() in ['salir', 'exit', 'bye']:
+                print("Cerrando sesion...")
+                break
+            
+            if not pregunta.strip():
+                continue
+
+            print("\nAnalizando...\n")
+            
+            respuesta = consultar_modelo(llm, contexto_datos, pregunta)
+            
+            print(f"Asesor: {respuesta}\n")
+            print("-" * 50)
+
+        except KeyboardInterrupt:
+            print("\nSesion interrumpida por el usuario.")
+            break
+        except Exception as e:
+            print(f"Ocurrio un error inesperado: {e}")
+
+    # Limpieza de memoria al salir
     del llm
-    import gc
-    gc.collect()
-
-    print("\n==============================================")
-    print("PROCESO COMPLETO FINALIZADO EXITOSAMENTE.")
-    print(f"Revisa la carpeta: {ORQ_OUTPUT}")
-    print("==============================================")
 
 if __name__ == "__main__":
     main()
