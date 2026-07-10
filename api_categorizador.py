@@ -102,10 +102,8 @@ def obtener_ultimo_archivo(directorio, patron="*"):
 
 # --- LÓGICA DE EJECUCIÓN EN FONDO (WORKERS) ---
 
-def ejecutar_extraccion_sync(job_id: str, pdf_path: Path):
-    """
-    Ejecuta la lógica de extracción de datos (Fase 1) de forma síncrona.
-    """
+def ejecutar_extraccion_sync(job_id: str, pdf_path: Path, cliente_id: int = 0):
+    # Ejecuta la logica de extraccion de datos (Fase 1) de forma sincrona.
     trabajos[job_id]["status"] = "procesando"
     
     out_aislado = EXT_OUTPUT / f"out_{job_id}"
@@ -118,7 +116,7 @@ def ejecutar_extraccion_sync(job_id: str, pdf_path: Path):
         original_cwd = os.getcwd()
         try:
             os.chdir(DIR_EXTRACTOR)
-            extractor_ia.main_extraction_ia(str(pdf_path), str(out_aislado))
+            extractor_ia.main_extraction_ia(str(pdf_path), str(out_aislado), cliente_id=cliente_id)
         except Exception as e:
             print(f"Error critico en extractor IA: {e}")
             raise e
@@ -149,6 +147,13 @@ def ejecutar_extraccion_sync(job_id: str, pdf_path: Path):
                     "filename": json_file.name,
                     "data": content
                 }
+            
+            # Borra la copia de ORQ_OUTPUT una vez que el contenido ya está en memoria
+            try:
+                if dest.exists():
+                    dest.unlink()
+            except Exception:
+                pass
         
         print("--- [WORKER] FASE 1 COMPLETADA ---")
         trabajos[job_id]["status"] = "completado"
@@ -161,6 +166,12 @@ def ejecutar_extraccion_sync(job_id: str, pdf_path: Path):
     finally:
         if out_aislado.exists():
             shutil.rmtree(out_aislado)
+        # Borra el PDF original de EXT_INPUT una vez que el worker terminó de usarlo
+        try:
+            if pdf_path.exists():
+                pdf_path.unlink()
+        except Exception:
+            pass
 
 def ejecutar_categorizacion_sync(job_id: str, archivos_guardados: list):
     try:
@@ -200,9 +211,35 @@ def ejecutar_categorizacion_sync(job_id: str, archivos_guardados: list):
                         
                         with open(dest_final, "r", encoding="utf-8") as f:
                             resultados_categorizados[nombre_archivo] = json.load(f)
+                        
+                        # Borra el archivo de análisis de MOD_OUTPUT una vez copiado
+                        try:
+                            if res.exists():
+                                res.unlink()
+                        except Exception:
+                            pass
                     else:
                         print(f"Advertencia: No se genero salida para {nombre_archivo}")
                         resultados_categorizados[nombre_archivo] = {"error": "El modelo no generó salida"}
+
+            # Borra los archivos de entrada de MOD_INPUT que ya fueron procesados
+            for nombre_archivo in archivos_guardados:
+                try:
+                    ruta_mod_input = MOD_INPUT / nombre_archivo
+                    if ruta_mod_input.exists():
+                        ruta_mod_input.unlink()
+                except Exception:
+                    pass
+
+            # Borra los archivos _CON_GIROS de ORQ_OUTPUT una vez que el contenido ya está en memoria
+            for nombre_archivo in archivos_guardados:
+                try:
+                    nombre_base = Path(nombre_archivo).stem
+                    ruta_con_giros = ORQ_OUTPUT / f"{nombre_base}_CON_GIROS.json"
+                    if ruta_con_giros.exists():
+                        ruta_con_giros.unlink()
+                except Exception:
+                    pass
 
             print("--- [WORKER] FASE 2 COMPLETADA ---")
             trabajos[job_id]["status"] = "completado"
@@ -233,7 +270,7 @@ def ejecutar_perfilado_sync(job_id: str, nombre_real_datos: str):
         
         try:
             print("Cargando modelo de perfilado...")
-            llm = mod.cargar_modelo(mod.RUTA_MODELO_8B)
+            llm = mod.cargar_modelo(mod.RUTA_MODELO_8B, n_ctx=mod.CONTEXTO_TOTAL_FASE3)
             
             # Ejecuta el perfilado empresarial
             mod.procesar_perfilado_empresarial(llm, "TEMP_EXEC_DATOS.json")
@@ -246,10 +283,34 @@ def ejecutar_perfilado_sync(job_id: str, nombre_real_datos: str):
                 
                 shutil.copy(out_path, dest_final)
                 
+                # Borra el archivo de salida del modelo en MOD_OUTPUT una vez copiado
+                try:
+                    out_path.unlink()
+                except Exception:
+                    pass
+                
                 with open(dest_final, "r", encoding="utf-8") as f:
-                    print("--- [WORKER] FASE 3 COMPLETADA ---")
-                    trabajos[job_id]["status"] = "completado"
-                    trabajos[job_id]["resultado"] = json.load(f)
+                    contenido_perfil = json.load(f)
+
+                # Borra el perfil de ORQ_OUTPUT una vez que el contenido está en memoria
+                try:
+                    if dest_final.exists():
+                        dest_final.unlink()
+                except Exception:
+                    pass
+
+                # Borra los archivos temporales de MOD_INPUT
+                for nombre_temp in ["TEMP_EXEC_DATOS.json", "TEMP_EXEC_INGRESOS_CON_GIROS.json", "TEMP_EXEC_EGRESOS_CON_GIROS.json"]:
+                    try:
+                        ruta_temp = MOD_INPUT / nombre_temp
+                        if ruta_temp.exists():
+                            ruta_temp.unlink()
+                    except Exception:
+                        pass
+
+                print("--- [WORKER] FASE 3 COMPLETADA ---")
+                trabajos[job_id]["status"] = "completado"
+                trabajos[job_id]["resultado"] = contenido_perfil
             else:
                 trabajos[job_id]["status"] = "error"
                 trabajos[job_id]["error"] = "El modelo no generó el perfil."
@@ -268,9 +329,9 @@ def ejecutar_perfilado_sync(job_id: str, nombre_real_datos: str):
 # -----------------------------------------------------------------------------
 # WORKER FASE 3.5: BIENVENIDA Y SUGERENCIAS (TOTALMENTE INDEPENDIENTE)
 # -----------------------------------------------------------------------------
-def ejecutar_bienvenida_independiente_sync(job_id: str, archivos_temp_paths: List[Path], carpeta_temporal: Path):
+def ejecutar_bienvenida_independiente_sync(job_id: str, archivos_temp_paths: List[Path], carpeta_temporal: Path, cliente_id: int = 0, usuario_id: int = 0):
     try:
-        print(f"\n--- [WORKER] FASE 3.5 (INDEPENDIENTE) | JOB: {job_id} ---")
+        print(f"\n--- [WORKER] FASE 3.5 (INDEPENDIENTE) | JOB: {job_id} | Cliente: {cliente_id} ---")
         trabajos[job_id]["status"] = "procesando"
 
         # 1. INVOCA AL CHATBOT PARA GENERAR SUGERENCIAS
@@ -287,7 +348,7 @@ def ejecutar_bienvenida_independiente_sync(job_id: str, archivos_temp_paths: Lis
         contexto_datos = chatbot_module.leer_archivos_json(carpeta_temporal)
         
         # 3. GENERA LA RESPUESTA
-        respuesta_sugerencias = chatbot_module.generar_bienvenida_cfo(modelo, contexto_datos)
+        respuesta_sugerencias = chatbot_module.generar_bienvenida_cfo(modelo, contexto_datos, cliente_id=cliente_id, usuario_id=usuario_id)
 
         print("--- [WORKER] FASE 3.5 COMPLETADA ---")
         trabajos[job_id]["status"] = "completado"
@@ -315,9 +376,9 @@ def ejecutar_bienvenida_independiente_sync(job_id: str, archivos_temp_paths: Lis
 # -----------------------------------------------------------------------------
 # WORKER FASE 3.7: ANÁLISIS COMPARATIVO HISTÓRICO (INDEPENDIENTE)
 # -----------------------------------------------------------------------------
-def ejecutar_comparativa_independiente_sync(job_id: str, archivos_temp_paths: List[Path], carpeta_temporal: Path):
+def ejecutar_comparativa_independiente_sync(job_id: str, archivos_temp_paths: List[Path], carpeta_temporal: Path, cliente_id: int = 0, usuario_id: int = 0):
     try:
-        print(f"\n--- [WORKER] FASE 3.7 (COMPARATIVA) | JOB: {job_id} ---")
+        print(f"\n--- [WORKER] FASE 3.7 (COMPARATIVA) | JOB: {job_id} | Cliente: {cliente_id} ---")
         trabajos[job_id]["status"] = "procesando"
 
         # 1. INVOCA AL MÓDULO PARA GENERAR ANÁLISIS
@@ -334,7 +395,7 @@ def ejecutar_comparativa_independiente_sync(job_id: str, archivos_temp_paths: Li
         contexto_datos = chatbot_module.leer_archivos_json(carpeta_temporal)
         
         # 3. GENERA EL REPORTE COMPARATIVO (Ajusta el nombre de la función aquí si es diferente)
-        respuesta_comparativa = chatbot_module.generar_analisis_fase_3_7(modelo, contexto_datos)
+        respuesta_comparativa = chatbot_module.generar_analisis_fase_3_7(modelo, contexto_datos, cliente_id=cliente_id, usuario_id=usuario_id)
 
         print("--- [WORKER] FASE 3.7 COMPLETADA ---")
         trabajos[job_id]["status"] = "completado"
@@ -359,12 +420,10 @@ def ejecutar_comparativa_independiente_sync(job_id: str, archivos_temp_paths: Li
         except Exception as e:
             pass
 
-def ejecutar_chatbot_sync(job_id: str, session_id: str, archivos_temp_paths: List[Path], pregunta_usuario: str, es_nueva_sesion: bool, temp_ingest_dir: Path = None):
-    """
-    Ejecuta la lógica del Chatbot (Fase 4) gestionando memoria de sesión.
-    """
+def ejecutar_chatbot_sync(job_id: str, session_id: str, archivos_temp_paths: List[Path], pregunta_usuario: str, es_nueva_sesion: bool, temp_ingest_dir: Path = None, cliente_id: int = 0, usuario_id: int = 0):
+    # Ejecuta la logica del Chatbot (Fase 4) gestionando memoria de sesion.
     try:
-        print(f"\n--- [WORKER] CHATBOT | SESIÓN: {session_id} ---")
+        print(f"\n--- [WORKER] CHATBOT | SESION: {session_id} | Cliente: {cliente_id} | Usuario: {usuario_id} ---")
         trabajos[job_id]["status"] = "procesando"
 
         # 1. GESTIONA CARPETAS Y ARCHIVOS
@@ -437,7 +496,7 @@ def ejecutar_chatbot_sync(job_id: str, session_id: str, archivos_temp_paths: Lis
         print(f"Generando respuesta para: '{pregunta_usuario}' usando historial de {len(historial_actual)} turnos.")
         
         # Genera la respuesta pasando el historial acumulado
-        respuesta = chatbot_module.generar_respuesta_chat(modelo, contexto_datos, historial_actual, pregunta_usuario)
+        respuesta = chatbot_module.generar_respuesta_chat(modelo, contexto_datos, historial_actual, pregunta_usuario, cliente_id=cliente_id, usuario_id=usuario_id)
 
         # 4. ACTUALIZA LA MEMORIA GLOBAL
         CHAT_SESSIONS[session_id]["historial"].append({"q": pregunta_usuario, "a": respuesta})
@@ -475,7 +534,10 @@ async def obtener_estado(job_id: str):
     return trabajos[job_id]
 
 @app.post("/fase1/extraer")
-async def extraer_pdf(file: UploadFile = File(...)):
+async def extraer_pdf(
+    file: UploadFile = File(...),
+    cliente_id: int = Form(default=0)
+):
     try:
         job_id = str(uuid.uuid4())
         limpiar_directorio(EXT_INPUT)
@@ -483,9 +545,9 @@ async def extraer_pdf(file: UploadFile = File(...)):
         with open(pdf_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
             
-        print(f"Solicitud recibida F1. Job ID: {job_id}")
+        print(f"Solicitud recibida F1. Job ID: {job_id} | Cliente: {cliente_id}")
         trabajos[job_id] = {"status": "iniciado", "resultado": None, "error": None}
-        executor_gpu.submit(ejecutar_extraccion_sync, job_id, pdf_path)
+        executor_gpu.submit(ejecutar_extraccion_sync, job_id, pdf_path, cliente_id)
         return {"job_id": job_id, "status": "iniciado"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -546,12 +608,12 @@ async def perfilar_empresa(files: List[UploadFile] = File(...)):
 
 @app.post("/fase3_5/bienvenida")
 async def generar_bienvenida_independiente(
-    files: List[UploadFile] = File(None)
+    files: List[UploadFile] = File(None),
+    cliente_id: int = Form(default=0),
+    usuario_id: int = Form(default=0)
 ):
-    """
-    Endpoint Fase 3.5 (Stateless): Recibe archivos, genera opciones de preguntas y destruye los archivos.
-    No interactúa con CHAT_SESSIONS ni con la Fase 4. Tolerante a peticiones sin archivos.
-    """
+    # Endpoint Fase 3.5 (Stateless): Recibe archivos, genera opciones de preguntas y destruye los archivos.
+    # No interactua con CHAT_SESSIONS ni con la Fase 4. Tolerante a peticiones sin archivos.
     try:
         job_id = str(uuid.uuid4())
         saved_paths = []
@@ -569,11 +631,10 @@ async def generar_bienvenida_independiente(
                 saved_paths.append(dest_path)
 
         num_files = len(files) if files else 0
-        print(f"Solicitud API F3.5. Job: {job_id} | Archivos recibidos: {num_files}")
+        print(f"Solicitud API F3.5. Job: {job_id} | Archivos recibidos: {num_files} | Cliente: {cliente_id}")
         trabajos[job_id] = {"status": "iniciado", "resultado": None, "error": None}
         
-        # Ejecuta el proceso en el pool para no bloquear el API (Se le pasa temp_dir para evitar fallos si no hay archivos)
-        executor_chat.submit(ejecutar_bienvenida_independiente_sync, job_id, saved_paths, temp_dir)
+        executor_chat.submit(ejecutar_bienvenida_independiente_sync, job_id, saved_paths, temp_dir, cliente_id, usuario_id)
         
         return {"job_id": job_id, "status": "iniciado"}
 
@@ -583,12 +644,12 @@ async def generar_bienvenida_independiente(
 
 @app.post("/fase3_7/comparar")
 async def generar_comparativa_independiente(
-    files: List[UploadFile] = File(...)
+    files: List[UploadFile] = File(...),
+    cliente_id: int = Form(default=0),
+    usuario_id: int = Form(default=0)
 ):
-    """
-    Endpoint Fase 3.7 (Stateless): Recibe estados de cuenta históricos y actuales, 
-    genera el análisis comparativo en HTML/LaTeX y destruye los archivos.
-    """
+    # Endpoint Fase 3.7 (Stateless): Recibe estados de cuenta historicos y actuales,
+    # genera el analisis comparativo en HTML/LaTeX y destruye los archivos.
     try:
         job_id = str(uuid.uuid4())
         saved_paths = []
@@ -606,11 +667,10 @@ async def generar_comparativa_independiente(
                 saved_paths.append(dest_path)
 
         num_files = len(files) if files else 0
-        print(f"Solicitud API F3.7. Job: {job_id} | Archivos recibidos: {num_files}")
+        print(f"Solicitud API F3.7. Job: {job_id} | Archivos recibidos: {num_files} | Cliente: {cliente_id}")
         trabajos[job_id] = {"status": "iniciado", "resultado": None, "error": None}
         
-        # Ejecuta el proceso en el pool de chat (usa pocos recursos de RAM)
-        executor_chat.submit(ejecutar_comparativa_independiente_sync, job_id, saved_paths, temp_dir)
+        executor_chat.submit(ejecutar_comparativa_independiente_sync, job_id, saved_paths, temp_dir, cliente_id, usuario_id)
         
         return {"job_id": job_id, "status": "iniciado"}
 
@@ -622,21 +682,21 @@ async def generar_comparativa_independiente(
 async def chatbot_consultar(
     files: List[UploadFile] = File(None),
     pregunta: str = Form(...),
-    session_id: str = Form(...)
+    session_id: str = Form(...),
+    cliente_id: int = Form(default=0),
+    usuario_id: int = Form(default=0)
 ):
-    """
-    Endpoint Chatbot con soporte de SESIONES y tolerante a peticiones sin archivos.
-    """
+    # Endpoint Chatbot con soporte de SESIONES y tolerante a peticiones sin archivos.
     try:
         job_id = str(uuid.uuid4())
         es_nueva_sesion = False
         saved_paths = []
         temp_ingest_dir = None
 
-        # Verifica si la sesión existe en memoria
+        # Verifica si la sesion existe en memoria
         if session_id not in CHAT_SESSIONS:
-            print(f"Nueva sesión detectada: {session_id}")
-            CHAT_SESSIONS[session_id] = {"historial": [], "ruta_datos": None}
+            print(f"Nueva sesion detectada: {session_id} | Cliente: {cliente_id} | Usuario: {usuario_id}")
+            CHAT_SESSIONS[session_id] = {"historial": [], "ruta_datos": None, "cliente_id": cliente_id, "usuario_id": usuario_id}
             es_nueva_sesion = True
             
             # Guarda archivos temporalmente para que el worker los procese
@@ -657,8 +717,12 @@ async def chatbot_consultar(
         
         trabajos[job_id] = {"status": "iniciado", "resultado": None, "error": None}
         
+        # Recupera identificadores de la sesion (nuevos o existentes)
+        cliente_id_sesion = CHAT_SESSIONS[session_id].get("cliente_id", cliente_id)
+        usuario_id_sesion = CHAT_SESSIONS[session_id].get("usuario_id", usuario_id)
+
         # Ejecuta el worker en el pool INDEPENDIENTE del chat
-        executor_chat.submit(ejecutar_chatbot_sync, job_id, session_id, saved_paths, pregunta, es_nueva_sesion, temp_ingest_dir)
+        executor_chat.submit(ejecutar_chatbot_sync, job_id, session_id, saved_paths, pregunta, es_nueva_sesion, temp_ingest_dir, cliente_id_sesion, usuario_id_sesion)
         
         return {"job_id": job_id, "status": "iniciado"}
 
